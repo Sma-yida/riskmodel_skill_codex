@@ -1,0 +1,34 @@
+{
+    "data_path": {
+        "dev_data_path": "outputs/data_clean_split/data/train",
+        "oot_data_path": "outputs/data_clean_split/data/test",
+        "psi_data_path": "outputs/data_clean_split/data/psi"
+    },
+    "output_path": {
+        "dst": "outputs/feature_select",
+        "dst_outs": "outputs/feature_select/outputs",
+        "use_feature_path": "outputs/feature_select/outputs/use_fea.json",
+        "mono_var_path": "outputs/feature_select/outputs/mono_var.csv",
+        "single_var_path": "outputs/feature_select/outputs/single_var.csv",
+        "feature_json_path": "results/feature_select.json",
+        "feature_startup_path": "logs/feature_select_startup.txt"
+    },
+    "settings": {
+        "id_col": "id",
+        "date_col": "date",
+        "label": "label",
+        "base_fea": [
+            "id",
+            "date",
+            "label",
+            "channel"
+        ],
+        "iv_thresh": 0.02,
+        "psi_thresh": 0.2,
+        "miss_thresh": 0.9,
+        "corr_thresh": 0.8,
+        "use_null_importance": false,
+        "top_n": 500,
+        "upload_fea_list": []
+    }
+}

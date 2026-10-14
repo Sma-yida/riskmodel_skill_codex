@@ -1,0 +1,129 @@
+{
+    "data_path": {
+        "dev_data_path": "outputs/data_clean_split/data/train",
+        "oot_data_path": "outputs/data_clean_split/data/test",
+        "feature_dic_path": "data/feature_dict.csv",
+        "use_fea_path": "outputs/feature_select/outputs/use_fea.json"
+    },
+    "output_path": {
+        "dst": "outputs/model_train",
+        "dst_model": "outputs/model_train/model",
+        "dst_outs": "outputs/model_train/outputs",
+        "pkl_model_path": "outputs/model_train/model/model.pkl",
+        "pmml_model_path": "outputs/model_train/model/model.pmml",
+        "feature_importance_path": "outputs/model_train/outputs/feature_imp.csv",
+        "model_params_path": "outputs/model_train/outputs/model_params.json",
+        "model_fea_path": "outputs/model_train/outputs/final_model_fea.json",
+        "model_json_path": "results/model_train.json",
+        "model_startup_path": "logs/model_train_startup.txt"
+    },
+    "settings": {
+        "id_col": "id",
+        "label": "label",
+        "model_select": "LightGBM",
+        "n_trials": 10,
+        "ks_gap_threshold": 1.0,
+        "autogluon_time_limit": 300,
+        "save_autogluon_predictor": true,
+        "RUN_HPO": false,
+        "optimization_mode": "multi",
+        "optimization_targets": [],
+        "lr_scorecard_params": {
+            "binning_method": "chi",
+            "adj_rules": {},
+            "fine_selection_corr": 0.6,
+            "stepwise_criterion": "aic",
+            "score_scale": {
+                "base_score": 500,
+                "pdo": 30,
+                "base_odds": 20
+            }
+        },
+        "model_param": {
+            "boosting_type": "gbdt",
+            "objective": "binary",
+            "random_state": 42,
+            "max_depth": -1,
+            "n_jobs": 16,
+            "verbose": -1,
+            "class_weight": null,
+            "scale_pos_weight": 1.0,
+            "subsample_for_bin": 200000,
+            "importance_type": "split",
+            "min_child_samples": 20,
+            "min_split_gain": 0,
+            "learning_rate": 0.033,
+            "num_leaves": 11,
+            "max_bin": 108,
+            "reg_alpha": 5.0,
+            "reg_lambda": 125.0,
+            "subsample": 0.539,
+            "colsample_bytree": 0.229,
+            "subsample_freq": 2,
+            "min_child_weight": 17.0,
+            "n_estimators": 5
+        },
+        "model_selection_params": {
+            "min_split_gain": [
+                0,
+                10,
+                1
+            ],
+            "learning_rate": [
+                0.03,
+                0.2
+            ],
+            "num_leaves": [
+                8,
+                60
+            ],
+            "max_bin": [
+                20,
+                350
+            ],
+            "min_child_samples": [
+                20,
+                100,
+                10
+            ],
+            "reg_alpha": [
+                0,
+                20.0
+            ],
+            "reg_lambda": [
+                0,
+                200.0,
+                5
+            ],
+            "subsample": [
+                0.2,
+                1.0
+            ],
+            "colsample_bytree": [
+                0.2,
+                1.0
+            ],
+            "subsample_freq": [
+                1,
+                10
+            ],
+            "min_child_weight": [
+                1.0,
+                20.0,
+                0.5
+            ],
+            "n_estimators": [
+                500
+            ],
+            "max_depth": [
+                -1,
+                -1
+            ],
+            "scale_pos_weight": [
+                1.0,
+                1.0,
+                0.1
+            ]
+        }
+    }
+}

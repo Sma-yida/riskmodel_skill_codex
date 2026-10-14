@@ -1,0 +1,52 @@
+{
+    "model_file": {
+        "pkl_model_path": "outputs/model_train/model/model.pkl",
+        "pmml_model_path": "outputs/model_train/model/model.pmml",
+        "model_fea_path": "outputs/model_train/outputs/final_model_fea.json",
+        "autogluon_predictor_path": "outputs/model_train/model/autogluon_predictor",
+        "model_train_config_path": "config/model_train_config.json"
+    },
+    "data_path": {
+        "oot_data_path": "outputs/data_clean_split/data/test",
+        "psi_data_path": "outputs/data_clean_split/data/psi",
+        "dev_data_path": "outputs/data_clean_split/data/train"
+    },
+    "output_path": {
+        "dst": "outputs/model_eval",
+        "dst_data": "outputs/model_eval/data",
+        "dst_rp": "outputs/model_eval/report",
+        "dst_outs": "outputs/model_eval/outputs",
+        "eval_json_path": "results/model_eval.json",
+        "eval_startup_path": "logs/model_eval_startup.txt",
+        "model_evaluation_report_path": "outputs/model_eval/report/model_evaluation_report.xlsx"
+    },
+    "settings": {
+        "id_col": "id",
+        "date_col": "date",
+        "label": "label",
+        "channel_col": "channel",
+        "base_fea": [
+            "id",
+            "date",
+            "label",
+            "channel"
+        ],
+        "bin_num": 10,
+        "pdo": 91,
+        "theta": 8.6,
+        "p0": 410,
+        "cut_points": [],
+        "gen_report": true,
+        "save_output": true,
+        "run_eval": true,
+        "eval_model_type": null,
+        "eval_model_name": null
+    },
+    "report_all": {
+        "data_quality_report_path": "outputs/data_analysis/report/data_quality_report.xls",
+        "feature_importance_path": "outputs/model_train/outputs/feature_imp.csv",
+        "target_stats_report_path": "outputs/data_clean_split/report/target_stats_report.csv",
+        "mono_var_path": "outputs/feature_select/outputs/mono_var.csv",
+        "single_var_path": "outputs/feature_select/outputs/single_var.csv"
+    }
+}

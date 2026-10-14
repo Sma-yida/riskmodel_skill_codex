@@ -1,0 +1,49 @@
+{
+    "data_path": "data/data",
+    "output_path": {
+        "dst": "outputs/data_clean_split",
+        "dst_data": "outputs/data_clean_split/data",
+        "dst_rp": "outputs/data_clean_split/report",
+        "dst_outs": "outputs/data_clean_split/outputs",
+        "dst_rp_path": "outputs/data_clean_split/report/target_stats_report.csv",
+        "clean_json_path": "results/data_clean_split.json",
+        "clean_startup_path": "logs/data_clean_split_startup.txt",
+        "dev_data_path": "outputs/data_clean_split/data/train",
+        "oot_data_path": "outputs/data_clean_split/data/test",
+        "psi_data_path": "outputs/data_clean_split/data/psi",
+        "cleaned_data_path": "outputs/data_clean_split/data/cleaned_data"
+    },
+    "settings": {
+        "id_col": "id",
+        "date_col": "date",
+        "channel_col": "channel",
+        "label": "label",
+        "base_fea": [
+            "id",
+            "date",
+            "label",
+            "channel"
+        ],
+        "product_list_keep": [],
+        "label_list_keep": [
+            0,
+            1
+        ],
+        "fill_val": -9999,
+        "method": "date_proportion",
+        "train_split_range": [
+            20230401,
+            20240228
+        ],
+        "oot_split_range": [
+            20240301,
+            20240331
+        ],
+        "psi_split_range": [
+            20240301,
+            20240331
+        ],
+        "test_size": 0.2,
+        "random_state": 42
+    }
+}

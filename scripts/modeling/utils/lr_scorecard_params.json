@@ -1,0 +1,84 @@
+{
+  "_说明": "LrScorecard内部默认参数。用户通过模型训练配置调整binning_method、adj_rules、fine_selection_corr、stepwise_criterion和score_scale。",
+  "missing_values": {
+    "numeric": [-99999, -9999, -9998, -9997, -9996],
+    "categorical": ["-99999", "-9999", "-9998", "-9997", "-9996", "", " "]
+  },
+  "binning": {
+    "method": "chi",
+    "adj_rules": {},
+    "method_params": {
+      "chi": {
+        "max_n_bins": 5,
+        "constraint_mode": "all"
+      },
+      "dt": {},
+      "quantile": {},
+      "step": {}
+    }
+  },
+  "woe": {
+    "exclude": null
+  },
+  "fine_selection": {
+    "engine": "toad",
+    "empty": false,
+    "iv": 0.05,
+    "corr": 0.6,
+    "exclude": null,
+    "return_drop": true,
+    "identical": 0.95,
+    "remove": null,
+    "target_rm": false
+  },
+  "stepwise": {
+    "estimator": "lr",
+    "direction": "both",
+    "criterion": "aic",
+    "return_drop": true,
+    "exclude": null,
+    "intercept": true,
+    "p_value_enter": 0.2,
+    "p_remove": 0.01,
+    "p_enter": 0.01,
+    "target_rm": false
+  },
+  "logistic": {
+    "penalty": "l2",
+    "calculate_stats": true,
+    "dual": false,
+    "tol": 0.0001,
+    "C": 1.0,
+    "fit_intercept": true,
+    "intercept_scaling": 1,
+    "class_weight": null,
+    "random_state": 42,
+    "solver": "lbfgs",
+    "max_iter": 1000,
+    "multi_class": "auto",
+    "verbose": 0,
+    "warm_start": false,
+    "n_jobs": null,
+    "l1_ratio": null
+  },
+  "score_scale": {
+    "base_score": 500,
+    "pdo": 30,
+    "base_odds": 20,
+    "rate": 2
+  },
+  "prediction": {
+    "classification_threshold": 0.5,
+    "unseen_category_policy": "min"
+  },
+  "_参数分组说明": {
+    "missing_values": "改变哪些原始值在LrScorecard内部恢复为缺失值。",
+    "binning": "支持chi、dt、quantile和step四种自动分箱方法。method_params仅向当前method传递对应参数，未配置项沿用scorecardpipeline.Combiner默认值。",
+    "woe": "WOE由训练集各箱好坏分布确定；第一版只保留包的exclude接口，通常不要调整。",
+    "fine_selection": "改变WOE后IV、相关性和单一值筛选阈值。当前engine=toad时，缺失已映射为有效WOE值；empty=false明确关闭WOE矩阵空值筛选。remove只在scorecardpy路线生效。",
+    "stepwise": "改变逐步回归方向和入选准则；当前both模式按配置的AIC或BIC试加变量，并用p_value_enter回删。p_enter控制准则最小改善量，p_remove只在backward方向生效。安装版包装器未向toad传递max_iter，因此第一版不暴露该无效参数。",
+    "logistic": "改变WOE-LR的正则、求解器、迭代和类别权重。",
+    "score_scale": "只改变概率到分数的刻度，不改变LR坏概率。",
+    "prediction": "改变0/1分类阈值和未见类别的评分兜底。"
+  }
+}
