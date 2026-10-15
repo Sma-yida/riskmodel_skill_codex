@@ -25,3 +25,36 @@
 - 按时间范围切分时，train_split_range 和 oot_split_range 都必须明确给出；有数据质量分析结果时，还会核对是否落在数据日期内。
 - 日期写成 yyyyMMdd 整数，例如 20240301。
 <!-- 参数表结束 -->
+
+## 作用与前置条件
+
+要求数据质量分析成功且未过期。按当前规则清洗主数据、保留渠道并生成 train、test、psi；外部 `data/oot_*` 同时清洗。
+时间范围参数名中的 `oot_split_range` 实际控制从主数据切出的 test，外部 OOT 则由单独的 `oot_*` 文件提供，解读时必须区分。
+比例切分按日期排序；随机切分使用 random_state。date_range 必须落实训练与测试范围，PSI 范围未单独指定时随 OOT 范围联动。
+
+## 用户说法与参数
+
+| 用户说法 | 提交给 make_config 的变化 |
+|---|---|
+| “按时间排序，后 25% 留作测试” | `{"data_clean_split":{"split_method":"date_proportion","test_size":0.25}}` |
+| “随机切分，测试集两成，种子 7” | `{"data_clean_split":{"split_method":"random","test_size":0.2,"random_state":7}}` |
+| “只保留 APP” | `{"data_clean_split":{"channel_keep_list":["APP"]}}`，须确认实际渠道名称 |
+
+日期示例只说明格式：`{"data_clean_split":{"train_split_range":[20240101,20240118],"oot_split_range":[20240119,20240125]}}`。实际日期必须来自本项目需求和数据。检查部分越界的 warnings，不把有交集说成全部在范围内。
+
+## 结果与解读
+
+查看“数据清洗概览”“数据切分方式”“数据集分布”，分别报告清洗前后样本量、实际日期及各数据集坏样本比例。用实际结果说明是否出现空集、渠道丢失或明显分布变化，不自行重算。
+后台优先把清洗后的 `oot_main` 作为 PSI 数据；没有 oot_main 时才使用切分产生的 psi（比例/随机切分时通常等于 test）。用户指定 PSI 日期时，若另有 oot_main，应在确认前说明该优先级，不能承诺指定日期一定用于 PSI。
+清洗数据位于 `outputs/data_clean_split/data/`，分布明细为 `outputs/data_clean_split/report/target_stats_report.csv`。可选基线评估在 `outputs/baseline_model/`；基线失败可能作为警告出现，不等于主清洗失败。
+
+## 推荐下一步
+
+- “沿用当前设置执行特征筛选”：检查成功后直接执行。
+- “查看各月份样本及坏样本分布”：只读统计产物。
+- “调整时间范围后重做切分”：补齐日期、显示下游失效范围后确认。
+- 第 4 项为自定义输入。不能把 test 自动称作外部 OOT。
+
+## 常见失败
+
+范围格式错误、无样本、渠道过滤后为空、标签不足以分层：指出日志证据，并让用户调整对应参数。上游过期：重新分析后再清洗。外部 OOT 列缺失：报告具体文件和列，不自行生成缺失变量。

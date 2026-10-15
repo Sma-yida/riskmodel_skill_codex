@@ -1,4 +1,4 @@
-# 环境与工作目录（Step 2）
+# 环境与工作目录
 
 控制脚本仅依赖 Python 标准库，可用 Python 3.8+ 启动；模型环境统一为原生 CPython 3.9，支持 macOS / Linux。下面命令中的 `SKILL` 指本 `risk-modeling` 文件夹的绝对路径。脚本最终向 stdout 输出 JSON；进度向 stderr 输出，失败返回非零退出码。
 
@@ -27,7 +27,7 @@ python3 "$SKILL/scripts/setup_env.py" --check --python /absolute/env/bin/python 
 
 只有完全通过才更新 `~/.risk-modeling/settings.json`，保存 `python`、`checked_at`、`mapping_dir`、所需运行库位置和验证指纹。已有设置中的其他字段保留。测试可用环境变量 `RISKMODEL_HOME` 指定临时设置目录；不要将临时目录中的验证环境记录为正式生产环境。
 
-`env_support.runtime_env()` 用于构造后续任务的运行环境：指定 Python、原生库、Java 和映射表路径，禁用向 Skill 写入 Python 缓存，使用非交互绘图后端。Step 3 的执行器应复用它。
+`run_stage.py` 复用 `env_support.runtime_env()`：指定 Python、原生库、Java 和映射表路径，禁用向 Skill 写入 Python 缓存，使用非交互绘图后端。每次开始建模会话先执行上述环境检查；执行器要求本机记录已完成完整验收，不自动安装环境。
 
 ## 联网新建
 
@@ -94,7 +94,50 @@ python3 "$SKILL/scripts/init_workspace.py" --workdir /absolute/my_project
 | `data/` | 主数据 `data.csv` / `data.parquet` / `data.feather`；时间外数据 `oot_*`；可选映射表 `mapping/` |
 | `config/` | 五份环节配置，只补充缺失文件；以后通过 `make_config.py` 修改 |
 | `outputs/` | 后台生成的模型、中间数据和原始报告 |
-| `results/` | 五个环节的结果 JSON |
-| `logs/` | 启动标记与后续执行器日志 |
+| `results/` | 五个环节同名 JSON、Markdown、HTML |
+| `logs/` | 环节日志、task.json、stages/ 下的环节执行记录，以及运行锁 |
 
-默认基础列为 `id`、`date`、`label`、`channel`。初始化不加载全量数据，不覆盖任何已存在的数据、配置或结果；无效 JSON 只报告，不修复。`result_present` 仅表示结果文件存在；`startup_marker_present` 不等于仍在运行，当前 Step 2 不推断进程状态、不启动建模。
+默认基础列为 `id`、`date`、`label`、`channel`；建模标签为二分类 0/1。初始化不加载全量数据，不覆盖已存在的数据、配置或结果；无效 JSON 只报告，不修复。有旧结果但没有执行记录时标为 `untracked`，不能当作已验证前置结果。`startup_marker_present` 仅表示存在旧启动标记。初始化不会启动建模。
+
+## 执行、等待与停止
+
+以下操作须在用户确认环节和参数后执行；`--check`、`--status` 是只读检查。
+
+```bash
+python3 "$SKILL/scripts/run_stage.py" -w "$WORK" --start data_analysis data_clean_split --check
+python3 "$SKILL/scripts/run_stage.py" -w "$WORK" --start data_analysis data_clean_split
+python3 "$SKILL/scripts/run_stage.py" -w "$WORK" --wait --seconds 30
+python3 "$SKILL/scripts/run_stage.py" -w "$WORK" --status
+python3 "$SKILL/scripts/run_stage.py" -w "$WORK" --stop
+python3 "$SKILL/scripts/make_report.py" -w "$WORK" --stage data_analysis
+```
+
+`WORK` 是独立工作目录的绝对路径。五个环节必须按标准顺序列出，不能重复；未纳入本次执行范围的前置环节必须有效。同目录同时只能有一个任务，运行中配置工具拒绝写入。可用不同工作目录保留不同试验。
+
+`ok=true` 表示命令/查询成功；实际任务读取 `task.status`，环节读取 `stages.<环节>.state`：
+
+| 状态 | 含义与处理 |
+|---|---|
+| starting / running | 已启动或执行中，继续查询；不要再次启动 |
+| succeeded | 计算完成；还需留意 report_error 和具体输出警告 |
+| failed / stopped | 执行失败或已停止，当前环节不能作为前置结果 |
+| stale | 配置、输入、上游或产物变化，重跑受影响环节 |
+| untracked / invalid_result | 历史结果未验证或结果损坏；可查原文件，不跳过验证 |
+| interrupted | 执行记录未正常结束且锁已释放，查日志后重跑 |
+| unresponsive | 超过 15 秒无执行器心跳但仍持锁；不启动重复任务，不宣称已停止 |
+| report_failed | 计算成功，报告生成失败；补生成报告后接续剩余环节 |
+| ready | 报告已修复，remaining_stages 列出原任务尚未执行的环节；按原确认范围接续 |
+
+任务在独立进程运行，关闭聊天后可以查询同目录接续。`--wait` 默认 30 秒、最多 60 秒；它不会设置模型的运行时限。停止通过当前任务的停止请求交给执行器清理子进程；系统拒绝进程组操作时明确报错，不绕过权限或误停其他进程。
+
+## 重跑与结果有效性
+
+结果仍使用固定文件名，没有 run_id 或自动历史版本。重跑会清理该环节的旧 JSON/Markdown/HTML 及标准生成目录内旧产物；特征统计缓存保留，由后台按输入内容摘要核对。用户输入目录不清理。欲保留旧模型请先选择另一个工作目录。
+
+记录各环节当前配置摘要、相关输入及上游完成时间/结果摘要。大数据与普通产物用路径、大小、纳秒修改时间检查；辅助 JSON 另加 SHA-256。它能检测正常替换、增删和修改，不承诺识别人为保持大小及时间戳不变的篡改。输入在执行过程中变化会判失败。
+
+训练参数变化只使训练和评估失效；主数据变化从分析开始失效；外部 OOT 变化从清洗开始失效。只更改一个环节不会自动替用户重跑全部下游。
+
+报告完整展示 JSON，后台 Top N 摘要保持原口径并提供当前原始产物链接。只生成摘要不触发模型计算，报告缺失可以单独补生成。历史/过期结果不能被重新包装成当前报告。
+
+报告标注计算完成时间，并提醒它是当次运行的快照。静态 HTML 本身不会实时刷新结果状态；数据、参数或产物变化后，先让助手查询当前状态，再引用或分享旧报告。

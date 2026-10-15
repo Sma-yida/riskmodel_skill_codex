@@ -51,7 +51,7 @@ def run(config_path, session_id=None):
         # 4.运行模型评估
         result = evaluation_func(dev_df, test_df, psi_df, config, oot_files=oot_files)
         
-        if result is not None:
+        if result:
             end_time = datetime.datetime.now()
             elapsed_seconds = (end_time - start_time).total_seconds()
             elapsed_hms = format_elapsed_hms(elapsed_seconds)

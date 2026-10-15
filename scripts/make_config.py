@@ -16,6 +16,7 @@ import argparse
 import ast
 import copy
 import datetime
+from contextlib import nullcontext
 import json
 import os
 import sys
@@ -400,6 +401,9 @@ def _data_date_range(workdir):
     path = os.path.join(workdir, "results", "data_analysis.json")
     if not os.path.exists(path):
         return None
+    from execution_state import stage_statuses
+    if stage_statuses(workdir)["data_analysis"]["state"] != "succeeded":
+        return None
 
     def find(node):
         if isinstance(node, dict):
@@ -425,7 +429,7 @@ def _data_date_range(workdir):
     return None
 
 
-def cross_check(stage, old, new, changes, template, workdir):
+def cross_check(stage, old, new, changes, template, workdir, defer_data_range=False):
     """检查参数之间的关系，并在有工作目录时对照数据。返回 (错误, 提示, 说明)。"""
     errors, warnings, notes = [], [], []
     s = new["settings"]
@@ -452,9 +456,9 @@ def cross_check(stage, old, new, changes, template, workdir):
                     err(key, "按时间范围切分（date_range）时必须指定 %s（%s），当前还是默认示例值 %s"
                         % (key, label, json.dumps(s[key])))
             if workdir:
-                rng = _data_date_range(workdir)
+                rng = None if defer_data_range else _data_date_range(workdir)
                 if rng is None:
-                    warnings.append("还没有数据质量分析结果，无法核对时间范围是否落在数据日期内")
+                    warnings.append("尚无当前有效的数据质量分析结果，或已安排重跑分析；清洗执行前将根据最新结果核对日期范围")
                 else:
                     lo, hi = rng
                     for key in range_keys:
@@ -592,23 +596,31 @@ def main():
     except ValueError as e:
         emit({"ok": False, "error": "JSON 解析失败：%s。引号不好处理时可改用 --set-file" % e})
 
-    results, errors, warnings = prepare(workdir, all_changes)
-    out = {"ok": not errors, "mode": "check" if args.check else "write", "workdir": workdir,
-           "stages": [{k: v for k, v in r.items() if k != "_config"} for r in results]}
-    if errors:
-        out["errors"] = errors
-        out["message"] = "参数有误，未写入任何配置。请按 errors 修改后重新检查。"
-    if warnings:
-        out["warnings"] = warnings
-    if not errors and not args.check:
-        written = []
-        for r in results:
-            save_json(config_path(workdir, r["stage"]), r["_config"])
-            written.append("config/%s_config.json" % r["stage"])
-        out["written"] = written
-        out["message"] = "配置已写入"
-    elif not errors:
-        out["message"] = "检查通过（未写入）。用户确认后去掉 --check 再执行一次即可写入。"
+    from execution_state import TaskError, mutation_lock, within, work_root
+    try:
+        root = work_root(workdir)
+        with nullcontext() if args.check else mutation_lock(root):
+            results, errors, warnings = prepare(workdir, all_changes)
+            out = {"ok": not errors, "mode": "check" if args.check else "write", "workdir": workdir,
+                   "stages": [{k: v for k, v in r.items() if k != "_config"} for r in results]}
+            if errors:
+                out["errors"] = errors
+                out["message"] = "参数有误，未写入任何配置。请按 errors 修改后重新检查。"
+            if warnings:
+                out["warnings"] = warnings
+            if not errors and not args.check:
+                for r in results:
+                    within(root, "config/%s_config.json" % r["stage"])
+                written = []
+                for r in results:
+                    save_json(config_path(workdir, r["stage"]), r["_config"])
+                    written.append("config/%s_config.json" % r["stage"])
+                out["written"] = written
+                out["message"] = "配置已写入"
+            elif not errors:
+                out["message"] = "检查通过（未写入）。用户确认后去掉 --check 再执行一次即可写入。"
+    except (TaskError, OSError, ValueError) as exc:
+        emit({"ok": False, "error_kind": getattr(exc, "kind", "config_error"), "error": str(exc)})
     emit(out)
 
 

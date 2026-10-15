@@ -87,3 +87,49 @@ run_hpo 为 true 时，Optuna 在这些范围内搜索 LightGBM 参数。写法�
 - lightgbm_params.num_leaves 不能超过 2^max_depth（max_depth 为 -1 时不限制）。
 - 分组参数（lightgbm_params 等）只写要改的子参数，没写的保持当前值；lr_scorecard_params.adj_rules 会整体替换。
 <!-- 参数表结束 -->
+
+## 作用与前置条件
+
+要求前三个环节成功且未过期，且入模特征非空。同一工作目录保存当前一次训练结果；切换模型会重建训练产物，并使旧评估过期。需要保留多模型历史时使用不同工作目录，不能把旧文件混入当前结果。
+
+## 三类模型的实际行为
+
+| 模型 | 使用的参数与主要产物 | 解读重点 |
+|---|---|---|
+| LightGBM | lightgbm_params；可选 Optuna 单/多目标及 hpo_params；model.pkl、model.pmml、final_model_fea.json | train/test/主验证集表现、寻优目标和入模特征来源 |
+| AutoGluon | autogluon_params；比较后台支持的八类算法；leaderboard 和可选 predictor | 使用本次实际模型名称和排名，未成功训练的算法不算完成 |
+| LrScorecard | lr_scorecard_params；自动或人工分箱、WOE、细筛、逐步回归、LR；LR 子目录中的模型、分箱表、评分表和 Excel | 每一步特征数量、实际入模变量、分箱、系数及验证口径 |
+
+LightGBM 的 run_hpo、n_trials、hpo_params 不控制评分卡或 AutoGluon。AutoGluon 未保存 predictor 时，允许查看训练对比，但不能继续模型评估。
+训练早停 test、寻优目标集、最终报告主验证集可能不同，按输出明确名称；不能把使用 OOT 寻优后的 OOT 当成从未参与选择的独立验证集。
+
+## 用户说法与参数
+
+| 用户说法 | 提交给 make_config 的变化 |
+|---|---|
+| “用 LightGBM，100 棵树，2 线程” | `{"model_train":{"model_select":"LightGBM","lightgbm_params":{"n_estimators":100,"n_jobs":2}}}` |
+| “单目标，以 test 的 KS 寻优 5 次” | `{"model_train":{"model_select":"LightGBM","run_hpo":true,"n_trials":5,"optimization_mode":"single","optimization_targets":[{"dataset":"test","metric":"ks"}]}}` |
+| “多模型比较 300 秒，保存后评估” | `{"model_train":{"model_select":"AutoGluon","autogluon_params":{"autogluon_time_limit":300,"save_autogluon_predictor":true}}}` |
+| “LR 评分卡，用等频分箱” | `{"model_train":{"model_select":"LrScorecard","lr_scorecard_params":{"binning_method":"quantile"}}}` |
+
+人工分箱 adj_rules 整体替换；若用户要求只调整一个变量，先读现有规则并保留其余变量，再展示完整变化。score_scale 逐项合并，不能与模型评估的 pdo/p0 混为一组。
+
+## 复现文件与参数优先级
+
+训练前检查 `data/model_train_spec_lightgbm.json` 或 `data/model_train_spec_lrscorecard.json`（只读对应算法）。非空 use_features 优先于筛选名单；非空 model_params 会覆盖基础参数，LightGBM 还会跳过 HPO。
+将这种影响放入需求确认。若与本次请求冲突，先让用户选择复现现有文件或更新/移走该文件，不宣称普通参数覆盖了复现文件。输出 JSON 中的特征与参数来源是最终解读依据。
+
+## 结果与明细
+
+LightGBM 读取模型性能指标、寻优信息和特征重要性；重要性 JSON 可能只列前 15 个，完整表为 `outputs/model_train/outputs/feature_imp.csv`。
+AutoGluon JSON 排名可能只列前 15 个，完整表为 `outputs/model_train/outputs/autogluon_leaderboard.csv`。具体模型名从这次排名读取。
+评分卡的 IV 来自训练评分卡分箱，PSI 按训练切点比较主验证集（优先 oot_main，否则 test）与 train；不能与特征筛选阶段数字直接对照判错。查看 `outputs/model_train/LR/outputs/` 的 binning_review.csv、binning_detail.csv、scorecard_points.csv；完整报告在 `LR/report/评分卡模型报告.xlsx`。
+
+## 推荐下一步与失败处理
+
+- “评估本次训练模型”：先核对类型和模型是否保存，默认继承训练类型。
+- “查看完整模型报告/分箱明细/模型排名”：只读当前产物。
+- “调整指定参数重新训练”：列出具体参数、预算和评估将过期的影响后确认；未明确值则补充信息。
+- 第 4 项为自定义输入。
+
+PMML 缺失是 LightGBM 训练交付失败，即使已有 JSON 也不能放行。评分卡 list.remove 异常属于已知依赖边界，不自行删样本、改算法或升级包。训练数据单一标签、空特征、内存不足、Java 异常均按日志证据处理。AutoGluon 限时导致部分模型失败时如实说明实际排名，不承诺所有算法都已成功。

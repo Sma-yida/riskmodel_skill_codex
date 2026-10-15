@@ -37,9 +37,12 @@ def validate_profile(info):
     if info["system"] not in ("Darwin", "Linux"):
         raise SetupError("unsupported_system", "目前支持 macOS 和 Linux")
     machine = {"aarch64": "arm64", "amd64": "x86_64"}.get(info["machine"], info["machine"])
-    if machine != native_machine():
+    # A successfully launched arm64 interpreter on Darwin proves native ARM
+    # support even if the controller runs under Rosetta and sysctl is restricted.
+    native = "arm64" if info["system"] == "Darwin" and machine == "arm64" else native_machine()
+    if machine != native:
         raise SetupError("architecture_mismatch", "Python 架构 %s 与本机 %s 不一致；请选择本机原生 Python" %
-                         (info["machine"], native_machine()))
+                         (info["machine"], native))
 
 
 def check_versions(info):
@@ -202,7 +205,7 @@ class Manager:
         if not native["openmp_libraries"]:
             raise SetupError("missing_openmp", "未检测到已加载的 OpenMP 库")
         self.report["native"] = native
-        pip = self.run("pip-check", [python, "-m", "pip", "check"], env=env)
+        pip = self.run("pip-check", [python, "-m", "pip", "--no-cache-dir", "check"], env=env)
         if known_grpc_warning(pip, info):
             self.probe(python, "grpc", env)
             self.report["checks"][-2]["accepted_warning"] = "grpcio_platform_metadata"
@@ -252,7 +255,17 @@ class Manager:
                 except (ValueError, IndexError):
                     item["available"] = False
             items.append(item)
-        self.report.update(ok=True, candidates=items, native_machine=native_machine())
+        if sys.platform == "darwin" and any(i.get("available") and i.get("machine") == "arm64" for i in items):
+            native = "arm64"
+        else:
+            try:
+                native = native_machine()
+            except SetupError as exc:
+                if exc.kind != "architecture_unverified":
+                    raise
+                native = None
+                self.report.setdefault("warnings", []).append(str(exc))
+        self.report.update(ok=True, candidates=items, native_machine=native)
         return self.report
 
     def index_args(self):

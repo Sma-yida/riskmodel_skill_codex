@@ -5,6 +5,7 @@ JSON报告生成模块
 
 import os
 import json
+import math
 import re
 from pathlib import Path
 import pandas as pd
@@ -1200,8 +1201,19 @@ def generate_lr_scorecard_evaluation_json(config):
         raise ValueError("评分卡Excel与模型训练JSON的数据集名单不一致")
     for display_name, train_record in train_metric_lookup.items():
         excel_record = excel_metric_lookup[display_name]
-        comparable_fields = ("样本数", "坏样本率", "AUC", "KS")
-        if any(train_record[field] != excel_record[field] for field in comparable_fields):
+        # Training JSON uses 2 decimals; Excel stores metrics rounded to 4.
+        # Compare their numeric precision intervals instead of rounding Excel
+        # a second time (e.g. JSON 0.48 vs Excel 0.475 -> formatted 0.47).
+        tolerance = 0.5 * 10 ** -2 + 0.5 * 10 ** -4 + 1e-12
+        metrics_match = all(
+            math.isfinite(float(train_record[field]))
+            and math.isfinite(raw_performance_lookup[display_name][field])
+            and math.isclose(float(train_record[field]), raw_performance_lookup[display_name][field],
+                             rel_tol=0.0, abs_tol=tolerance)
+            for field in ("AUC", "KS")
+        )
+        if (any(train_record[field] != excel_record[field] for field in ("样本数", "坏样本率"))
+                or not metrics_match):
             raise ValueError(
                 f"评分卡Excel与模型训练JSON的{display_name}样本数、坏率、AUC或KS不一致"
             )

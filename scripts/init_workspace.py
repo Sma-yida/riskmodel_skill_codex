@@ -6,6 +6,7 @@ from pathlib import Path
 
 from common import (BASE_COLUMNS, DEFAULT_WORKDIR, RESULT_KEYS, SKILL_DIR, STAGE_IDS,
                     STARTUP_KEYS, WORKDIR_SUBDIRS, emit, resolve_workdir, template_path)
+from execution_state import TaskError, lock_busy, stage_statuses
 
 
 def initialize(workdir=None):
@@ -31,6 +32,8 @@ def initialize(workdir=None):
             json.loads(raw)
             templates[dest] = raw
     created = []
+    if (root / "logs").is_dir() and templates and lock_busy(root):
+        raise ValueError("任务运行期间不能补写配置，请等待任务结束")
     for path in paths:
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
@@ -55,7 +58,7 @@ def initialize(workdir=None):
             if any(root not in p.resolve().parents for p in (result, startup)):
                 raise ValueError("结果或启动标记路径位于工作目录之外")
             if result.is_file():
-                status.update(state="result_present", result=str(result),
+                status.update(state="untracked", result=str(result),
                               modified_at=result.stat().st_mtime)
                 try:
                     json.loads(result.read_text(encoding="utf-8"))
@@ -67,9 +70,17 @@ def initialize(workdir=None):
         except (ValueError, TypeError, KeyError, OSError) as exc:
             status.update(state="invalid_config", error=str(exc))
         statuses[stage] = status
+    verified = stage_statuses(root)
+    for stage, status in verified.items():
+        if (root / "logs/stages" / (stage + ".json")).exists():
+            statuses[stage].update(status)
+    task = {}
+    if (root / "logs/task.json").exists():
+        from run_stage import inspect
+        task = inspect(root)["task"]
     return {"ok": True, "workdir": str(root), "created": created,
             "data_files": sorted(p.name for p in (root / "data").iterdir() if p.is_file()),
-            "stages": statuses,
+            "stages": statuses, "task": task,
             "guidance": {"data": "将主数据命名为 data.csv、data.parquet 或 data.feather，放入 data/",
                          "required_columns": BASE_COLUMNS,
                          "optional": "时间外样本使用 oot_*.csv / parquet / feather；映射表默认放 data/mapping/",
@@ -82,7 +93,7 @@ def main():
     args = parser.parse_args()
     try:
         emit(initialize(args.workdir))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TaskError) as exc:
         emit({"ok": False, "error_kind": "workspace_error", "error": str(exc)})
 
 

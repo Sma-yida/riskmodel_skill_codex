@@ -14,6 +14,7 @@ ERROR_OPTIONS = {
     "missing_openmp": ["用 --library-dir 指定同架构 OpenMP 动态库目录", "联网使用 conda 新建含 OpenMP 的独立环境"],
     "missing_java": ["用 --java-home 指定已有 JDK 17", "联网使用 conda 新建包含 Java 的独立环境"],
     "architecture_mismatch": ["选择与本机架构一致的原生 Python 3.9", "在目标系统和架构上重新准备离线包"],
+    "architecture_unverified": ["在允许系统架构检测的终端重新运行检查", "Apple Silicon 机器可用原生 arm64 Python 启动控制脚本"],
     "network_error": ["检查连接或用 --index-url 指定可用的 HTTPS 镜像", "用 --wheel-dir 离线安装到新的 --prefix 路径"],
     "timeout": ["查看日志进度后增大 --timeout 或 --install-timeout", "改用已有环境或离线包，保留本次日志和部分环境"],
     "disk_full": ["释放目标磁盘空间", "用 --prefix 和 --log-dir 选择其他磁盘"],
@@ -57,14 +58,16 @@ def read_pins(path):
 
 def native_machine():
     machine = platform.machine().lower()
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and machine != "arm64":
         try:
             out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.optional.arm64"],
                                  capture_output=True, text=True, timeout=5)
-            if out.stdout.strip() == "1":
-                machine = "arm64"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            if out.returncode == 0 and out.stdout.strip() in ("0", "1"):
+                machine = "arm64" if out.stdout.strip() == "1" else "x86_64"
+            else:
+                raise SetupError("architecture_unverified", "系统未允许确认本机硬件架构，不能用当前控制进程架构代替；请允许架构检测后重试")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SetupError("architecture_unverified", "无法确认本机硬件架构：" + str(exc)) from exc
     return {"aarch64": "arm64", "amd64": "x86_64"}.get(machine, machine)
 
 
@@ -75,6 +78,7 @@ def runtime_env(python, library_dir=None, java_home=None, mapping_dir=None, cach
         if key.startswith("PIP_") or key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(key, None)
     env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1", MPLBACKEND="Agg",
+               PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2", PIP_CONFIG_FILE=os.devnull,
                PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
     env["PATH"] = str(Path(python).absolute().parent) + os.pathsep + env.get("PATH", "")
@@ -86,6 +90,8 @@ def runtime_env(python, library_dir=None, java_home=None, mapping_dir=None, cach
         env[key] = str(library_dir) + (os.pathsep + env[key] if env.get(key) else "")
     if mapping_dir:
         env["RISKMODEL_MAPPING_DIR"] = str(mapping_dir)
+    else:
+        env.pop("RISKMODEL_MAPPING_DIR", None)
     if cache_dir:
         env["MPLCONFIGDIR"] = str(cache_dir)
     return env
