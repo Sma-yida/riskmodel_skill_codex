@@ -1,13 +1,14 @@
 """Workspace locking, provenance and result validation (standard library only)."""
 import contextlib
-import fcntl
+import errno
 import json
 import os
 from pathlib import Path
 
-from common import (STAGE_IDS, STAGE_NAMES, SKILL_DIR, config_path, load_json,
+from common import (DATA_EXTS, STAGE_IDS, STAGE_NAMES, SKILL_DIR, config_path, load_json,
                     load_settings, template_path, find_data_file)
 from env_support import sha256
+from platform_process import IS_WINDOWS
 
 ACTIVE = {"starting", "running", "stopping"}
 SECTIONS = {
@@ -51,14 +52,53 @@ def within(root, relative):
     return path
 
 
-def acquire(root):
-    file = open(within(root, "logs/.task.lock"), "a+")
+def acquire_file(path):
+    file = open(path, "a+b")
     try:
-        fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if IS_WINDOWS:
+            import msvcrt
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
         file.close()
+        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            raise
         raise TaskError("workspace_busy", "工作目录已有任务或配置写入操作，请先查看状态或停止任务")
     return file
+
+
+class WindowsLocks:
+    """Launch gate prevents competing writes while task lock changes owner."""
+    def __init__(self, root):
+        self.task = None
+        self.gate = acquire_file(within(root, "logs/.launch.lock"))
+        try:
+            self.task = acquire_task(root)
+        except BaseException:
+            self.close()
+            raise
+
+    def release_task(self):
+        if self.task:
+            self.task.close()
+            self.task = None
+
+    def close(self):
+        self.release_task()
+        if self.gate:
+            self.gate.close()
+            self.gate = None
+
+
+def acquire_task(root):
+    return acquire_file(within(root, "logs/.task.lock"))
+
+
+def acquire(root):
+    return WindowsLocks(root) if IS_WINDOWS else acquire_task(root)
 
 
 @contextlib.contextmanager
@@ -130,7 +170,7 @@ def input_stamp(root, stage):
         algorithm = cfg["settings"]["model_select"].lower()
         paths += [data / "feature_dict.csv", data / ("model_train_spec_" + algorithm + ".json")]
     elif stage == "model_eval":
-        mapping = Path(load_settings().get("mapping_dir") or data / "mapping")
+        mapping = Path(load_settings(root).get("mapping_dir") or data / "mapping")
         paths.extend(mapping.rglob("*"))
         paths.append(data / "feature_dict.csv")
     if stage in ("data_analysis", "data_clean_split"):
@@ -144,6 +184,8 @@ def input_stamp(root, stage):
 def validate_config_paths(root, stage):
     cfg = load_json(config_path(str(root), stage))
     template = load_json(template_path(stage))
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("settings"), dict):
+        raise TaskError("invalid_config", stage + " 配置结构无效，请核对原文件或从备份恢复")
     for key in ("data_path", "output_path", "model_file", "report_all"):
         if cfg.get(key) != template.get(key):
             raise TaskError("unsupported_paths", "%s 的 %s 必须使用工作目录标准路径，请重新初始化缺失配置或通过 make_config 修改参数" % (stage, key))
@@ -153,6 +195,24 @@ def validate_config_paths(root, stage):
                 within(root, value)
     within(root, "config/" + stage + "_config.json")
     return cfg
+
+
+def validate_raw_inputs(root, stages):
+    """Reject ambiguous input selection before replacing any existing results."""
+    if not set(stages) & {"data_analysis", "data_clean_split"}:
+        return
+    data = Path(root) / "data"
+    groups = {"data": [data / ("data" + ext) for ext in DATA_EXTS if (data / ("data" + ext)).is_file()]}
+    if not groups["data"]:
+        raise TaskError("missing_data", "data/ 中缺少主数据 data.csv、data.parquet 或 data.feather；未启动任务")
+    if "data_clean_split" in stages:
+        for path in sorted(data.glob("oot_*")):
+            if path.is_file() and path.suffix in DATA_EXTS:
+                groups.setdefault(path.stem, []).append(path)
+    for name, paths in groups.items():
+        if len(paths) > 1:
+            raise TaskError("ambiguous_data", "%s 有多个格式版本：%s；请明确本次数据并将其他版本移出 data/，未自动选择或删除文件" %
+                            (name, "、".join(p.name for p in paths)))
 
 
 def required_artifacts(root, stage, cfg):
@@ -281,7 +341,7 @@ def stage_statuses(root):
                                 report_error=record.get("report_error"))
                     if any(not Path(p).is_file() for p in record.get("reports", {}).values()):
                         item["report_error"] = "报告文件缺失，可单独补生成"
-            except (OSError, ValueError, TaskError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, TaskError) as exc:
                 item.update(state="invalid_result", reason=str(exc))
         statuses[stage] = item
     return statuses

@@ -7,9 +7,11 @@ from pathlib import Path
 from common import (BASE_COLUMNS, DEFAULT_WORKDIR, RESULT_KEYS, SKILL_DIR, STAGE_IDS,
                     STARTUP_KEYS, WORKDIR_SUBDIRS, emit, resolve_workdir, template_path)
 from execution_state import TaskError, lock_busy, stage_statuses
+from project_state import PROJECT_FILE, read_project, update_project, validate_labels
 
 
-def initialize(workdir=None):
+def plan_workspace(workdir=None):
+    """Validate the proposed location and compute missing files without writing."""
     requested = Path(resolve_workdir(workdir) or Path.cwd() / DEFAULT_WORKDIR)
     if requested.is_symlink():
         raise ValueError("工作目录不能是符号链接：" + str(requested))
@@ -31,6 +33,21 @@ def initialize(workdir=None):
             raw = Path(template_path(stage)).read_bytes()
             json.loads(raw)
             templates[dest] = raw
+    read_project(root)  # A damaged project record must not be overwritten.
+    return root, paths, templates
+
+
+def initialize(workdir=None, check=False, label_meaning=None):
+    root, paths, templates = plan_workspace(workdir)
+    labels = validate_labels(label_meaning) if label_meaning is not None else None
+    if check:
+        return {"ok": True, "mode": "check", "workdir": str(root),
+                "would_create": [str(p.relative_to(root)) if p != root else "."
+                                 for p in paths if not p.exists()]
+                                + [str(p.relative_to(root)) for p in templates],
+                "project": read_project(root), "proposed_label_meaning": labels,
+                "data_files": sorted(p.name for p in (root / "data").glob("*") if p.is_file()),
+                "message": "仅预览，未创建目录或写文件；确认后去掉 --check"}
     created = []
     if (root / "logs").is_dir() and templates and lock_busy(root):
         raise ValueError("任务运行期间不能补写配置，请等待任务结束")
@@ -45,6 +62,8 @@ def initialize(workdir=None):
             created.append(str(path.relative_to(root)))
         except FileExistsError:
             pass
+    if labels is not None:
+        update_project(root, label_meaning=labels)
     statuses = {}
     for stage in STAGE_IDS:
         config = root / "config" / (stage + "_config.json")
@@ -79,6 +98,7 @@ def initialize(workdir=None):
         from run_stage import inspect
         task = inspect(root)["task"]
     return {"ok": True, "workdir": str(root), "created": created,
+            "project": read_project(root),
             "data_files": sorted(p.name for p in (root / "data").iterdir() if p.is_file()),
             "stages": statuses, "task": task,
             "guidance": {"data": "将主数据命名为 data.csv、data.parquet 或 data.feather，放入 data/",
@@ -90,9 +110,13 @@ def initialize(workdir=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workdir", help="默认当前目录下 riskmodel_work；已在工作目录中则复用")
+    parser.add_argument("--check", action="store_true", help="预览创建位置和缺失文件，不写入")
+    parser.add_argument("--label-zero", help="用户已说明的标签 0 含义，与 --label-one 同时提供")
+    parser.add_argument("--label-one", help="用户已说明的标签 1 含义，与 --label-zero 同时提供")
     args = parser.parse_args()
     try:
-        emit(initialize(args.workdir))
+        labels = None if args.label_zero is None and args.label_one is None else {"0": args.label_zero, "1": args.label_one}
+        emit(initialize(args.workdir, check=args.check, label_meaning=labels))
     except (OSError, ValueError, TaskError) as exc:
         emit({"ok": False, "error_kind": "workspace_error", "error": str(exc)})
 

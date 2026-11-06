@@ -7,8 +7,12 @@ import os
 import pickle
 import platform
 import sys
+import struct
 import traceback
 from pathlib import Path
+from env_support import enable_windows_dlls
+
+enable_windows_dlls()
 
 MODELING = Path(__file__).resolve().parent / "modeling"
 sys.path.insert(0, str(MODELING))
@@ -24,6 +28,7 @@ def inventory():
             "python_minor": "%d.%d" % sys.version_info[:2],
             "implementation": platform.python_implementation(), "system": platform.system(),
             "machine": platform.machine().lower(), "platform": sysconfig.get_platform(),
+            "bits": struct.calcsize("P") * 8,
             "packages": dict(sorted(packages.items()))}
 
 

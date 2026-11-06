@@ -8,15 +8,20 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 
 from common import (STAGE_IDS, MODELING_DIR, config_path, emit,
                     load_json, load_settings, resolve_workdir, save_json)
-from env_support import runtime_env, sha256
-from execution_state import (ACTIVE, TaskError, acquire, artifact_stamp, input_stamp,
+from env_support import runtime_env, sha256, enable_windows_dlls
+from execution_state import (ACTIVE, TaskError, acquire, acquire_task, artifact_stamp, input_stamp,
                              lock_busy, read_record, receipt_path, required_artifacts,
                              result_path, stage_statuses, tail, upstream_stamp,
-                             validate_config_paths, validate_plan, validate_result,
+                             validate_config_paths, validate_plan, validate_raw_inputs, validate_result,
                              within, work_root)
+from platform_process import IS_WINDOWS, spawn_tree, cleanup_windows
+from project_state import read_project
+
+enable_windows_dlls()
 
 
 def task_path(root):
@@ -40,7 +45,13 @@ def inspect(root):
     stages = stage_statuses(root)
     if stage and stage in stages and task.get("status") == "unresponsive":
         stages[stage]["state"] = "unresponsive"
+    try:
+        project, project_error = read_project(root), None
+    except (OSError, ValueError) as exc:
+        # Broken optional context must not prevent inspecting/stopping a task.
+        project, project_error = {}, str(exc)
     return {"ok": True, "workdir": str(root), "busy": busy, "task": task,
+            "project": project, "project_error": project_error,
             "stages": stages, "log_tail": tail(task.get("log"), 4000),
             "elapsed_seconds": round((task.get("finished_at") or time.time()) - task.get("started_at", time.time()), 1)}
 
@@ -48,10 +59,11 @@ def inspect(root):
 def preflight(root, stages):
     statuses = stage_statuses(root)
     validate_plan(stages, statuses)
-    settings = load_settings()
+    settings = load_settings(root)
     python = settings.get("python")
-    if not python or not Path(python).is_file() or not settings.get("verification", {}).get("full_passed"):
+    if not python or not Path(python).is_file() or settings.get("verification", {}).get("full_passed") is not True:
         raise TaskError("environment_unchecked", "请先用 setup_env.py --check 验证并记录建模环境")
+    validate_raw_inputs(root, stages)
     configs = {s: validate_config_paths(root, s) for s in stages}
     # Reuse exactly the parameter validation used by make_config, without writing.
     from make_config import apply_changes, cross_check, user_values
@@ -94,6 +106,7 @@ def start(root, stages):
             old.update(status="interrupted", finished_at=time.time())
             save_json(str(within(root, "logs/previous_task.json")), old)
         task = {"status": "starting", "stages": stages, "stage": None,
+                "launch_token": uuid.uuid4().hex,
                 "started_at": time.time(), "finished_at": None,
                 "settings": settings, "warnings": warnings,
                 "configs": {s: sha256(config_path(str(root), s)) for s in stages},
@@ -101,15 +114,70 @@ def start(root, stages):
         write_task(root, task)
         within(root, "logs/stop.json").unlink(missing_ok=True)
         with within(root, "logs/runner.log").open("w", encoding="utf-8") as log:
-            worker = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()),
-                                       "-w", str(root), "--worker", str(lock.fileno())],
-                                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                      start_new_session=True, pass_fds=(lock.fileno(),), cwd=str(root))
+            if IS_WINDOWS:
+                worker = start_windows_worker(root, task, lock, log)
+            else:
+                worker = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()),
+                                           "-w", str(root), "--worker", str(lock.fileno())],
+                                          stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                          start_new_session=True, pass_fds=(lock.fileno(),), cwd=str(root))
         # Worker owns the inherited lock; closing this duplicate does not unlock it.
         return {"ok": True, "status": "starting", "pid": worker.pid, "stages": stages,
                 "workdir": str(root), "warnings": warnings, "state_file": str(task_path(root))}
     finally:
         lock.close()
+
+
+def start_windows_worker(root, task, lock, log):
+    """Hand over the task lock under a separate launch gate; require readiness."""
+    process = None
+    try:
+        process = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()),
+                                    "-w", str(root), "--windows-worker", task["launch_token"]],
+                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                   creationflags=0x00000008 | 0x00000200, cwd=str(root))
+        lock.release_task()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and process.poll() is None:
+            ready = read_record(within(root, "logs/worker_ready.json"))
+            if ready.get("token") == task["launch_token"] and ready.get("pid") == process.pid:
+                save_json(str(within(root, "logs/worker_go.json")), {"token": task["launch_token"]})
+                return process
+            time.sleep(0.05)
+        raise TaskError("worker_start_failed", "Windows 执行器未完成启动交接；请查看 runner.log")
+    except BaseException:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+        task.update(status="failed", error_kind="worker_start_failed", finished_at=time.time())
+        write_task(root, task)
+        raise
+
+
+def windows_worker_lock(root, token):
+    deadline = time.monotonic() + 15
+    lock = None
+    try:
+        while lock is None:
+            try:
+                lock = acquire_task(root)
+            except TaskError as exc:
+                if exc.kind != "workspace_busy" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        if read_record(task_path(root)).get("launch_token") != token:
+            raise TaskError("worker_start_failed", "任务已被替换，拒绝运行旧启动请求")
+        save_json(str(within(root, "logs/worker_ready.json")), {"token": token, "pid": os.getpid()})
+        while read_record(within(root, "logs/worker_go.json")).get("token") != token:
+            if time.monotonic() >= deadline:
+                raise TaskError("worker_start_failed", "启动进程未完成交接，没有启动建模")
+            time.sleep(0.05)
+        return lock
+    except BaseException:
+        if lock:
+            lock.close()
+        raise
 
 
 def clean_stage(root, stage):
@@ -140,6 +208,12 @@ def stop_requested(root, task):
 
 def terminate_child(child):
     """Signal this worker's group; refuse a PID that now identifies another process."""
+    if IS_WINDOWS:
+        try:
+            cleanup_windows(child)
+        except (OSError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            raise TaskError("cleanup_incomplete", "Windows 任务进程树未确认停止：" + str(exc)) from exc
+        return
     def verify_identity():
         # An unreaped child PID cannot be reused. Its command can legitimately
         # change during interpreter startup, so comparing ps command text races.
@@ -181,8 +255,8 @@ def terminate_child(child):
             raise TaskError("cleanup_incomplete", "子进程尚未结束，不能报告停止成功；请查看 runner.log") from exc
 
 
-def worker(root, fd):
-    lock = os.fdopen(fd, "a+")
+def worker(root, fd=None, token=None):
+    lock = windows_worker_lock(root, token) if token is not None else os.fdopen(fd, "a+")
     task = read_record(task_path(root))
     task.update(status="running", pid=os.getpid())
     child, record, stage = None, None, None
@@ -214,10 +288,10 @@ def worker(root, fd):
                               **{k: task["settings"].get(k) for k in ("java_home", "library_dir", "mapping_dir")},
                               cache_dir=str(within(root, "logs/matplotlib")))
             with Path(record["log"]).open("w", encoding="utf-8") as log:
-                child = subprocess.Popen([task["settings"]["python"], "-B", "-u", str(Path(__file__).resolve()),
+                child = spawn_tree([task["settings"]["python"], "-B", "-u", str(Path(__file__).resolve()),
                                           "-w", str(root), "--backend", stage], cwd=str(root), env=env,
                                          stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                         start_new_session=True, pass_fds=(fd,))
+                                         **({} if IS_WINDOWS else {"pass_fds": (fd,)}))
                 while child.poll() is None:
                     write_task(root, task)
                     if interrupted[0] or stop_requested(root, task):
@@ -293,6 +367,7 @@ def main():
     action.add_argument("--wait", action="store_true")
     action.add_argument("--stop", action="store_true")
     action.add_argument("--worker", type=int, help=argparse.SUPPRESS)
+    action.add_argument("--windows-worker", help=argparse.SUPPRESS)
     action.add_argument("--backend", choices=STAGE_IDS, help=argparse.SUPPRESS)
     p.add_argument("--seconds", type=float, default=30, help="单次等待 0–60 秒，默认 30")
     p.add_argument("--check", action="store_true", help="配合 --start 只检查，不启动")
@@ -305,6 +380,9 @@ def main():
             sys.exit(backend(root, args.backend))
         if args.worker is not None:
             worker(root, args.worker)
+            return
+        if args.windows_worker is not None:
+            worker(root, token=args.windows_worker)
             return
         if args.start:
             if args.check:

@@ -17,6 +17,9 @@ from urllib.parse import urlparse
 from common import SETTINGS_PATH, emit, load_settings
 from env_support import (SetupError, atomic_json, native_machine, normalize, read_pins,
                          require_step, run_step, runtime_env, sha256)
+from platform_process import IS_WINDOWS
+from project_state import PROJECT_FILE, update_project
+from execution_state import TaskError, work_root
 
 HERE = Path(__file__).resolve().parent
 REQUIREMENTS = HERE / "requirements.txt"
@@ -24,6 +27,38 @@ CONSTRAINTS = HERE / "requirements" / "verified-macos-arm64-py39.txt"
 BOOTSTRAP = HERE / "requirements" / "bootstrap.txt"
 PROBE = HERE / "env_probe.py"
 FULL_CHECKS = ["imports", "pmml", "scorecard", "autogluon"]
+
+
+def constraints_for(info):
+    # The macOS snapshot contains Unix-only packages (e.g. memray).
+    machine = info["machine"].lower()
+    return CONSTRAINTS if info["system"] == "Darwin" and machine in ("arm64", "aarch64") else HERE / "requirements" / "portable-py39.txt"
+
+
+def environment_prefix(python):
+    parent = Path(python).parent
+    return parent.parent if parent.name.lower() in ("bin", "scripts") else parent
+
+
+def environment_python(prefix, venv=False):
+    prefix = Path(prefix)
+    if IS_WINDOWS:
+        return prefix / "Scripts" / "python.exe" if venv else prefix / "python.exe"
+    return prefix / "bin" / "python"
+
+
+def conda_executable(explicit=None):
+    candidate = explicit or os.environ.get("CONDA_EXE") or shutil.which("conda")
+    if candidate and IS_WINDOWS and Path(candidate).suffix.lower() in (".bat", ".cmd"):
+        # Avoid cmd.exe quoting/expansion for user paths. Standard conda installs
+        # provide the executable alongside the shell integration batch files.
+        for path in (Path(candidate).parent / "conda.exe", Path(candidate).parent.parent / "Scripts" / "conda.exe"):
+            if path.is_file():
+                return str(path)
+        if explicit:
+            raise SetupError("missing_conda", "请将 --conda 指向 Scripts/conda.exe，不能使用批处理脚本")
+        return None
+    return candidate
 
 
 def stamp():
@@ -34,9 +69,12 @@ def validate_profile(info):
     if info["python_minor"] != "3.9" or info["implementation"] != "CPython":
         raise SetupError("python_version", "需要 CPython 3.9，当前为 %s %s" %
                          (info["implementation"], info["version"]))
-    if info["system"] not in ("Darwin", "Linux"):
-        raise SetupError("unsupported_system", "目前支持 macOS 和 Linux")
-    machine = {"aarch64": "arm64", "amd64": "x86_64"}.get(info["machine"], info["machine"])
+    if info["system"] not in ("Darwin", "Linux", "Windows"):
+        raise SetupError("unsupported_system", "目前适配 macOS、Linux 和 Windows x64")
+    raw = info["machine"].lower()
+    machine = {"aarch64": "arm64", "amd64": "x86_64"}.get(raw, raw)
+    if info["system"] == "Windows" and (machine != "x86_64" or info.get("bits", 64) != 64):
+        raise SetupError("unsupported_architecture", "Windows 目前适配 64 位 x86 CPython 3.9；尚未适配原生 ARM/32 位环境")
     # A successfully launched arm64 interpreter on Darwin proves native ARM
     # support even if the controller runs under Rosetta and sysctl is restricted.
     native = "arm64" if info["system"] == "Darwin" and machine == "arm64" else native_machine()
@@ -65,19 +103,20 @@ def target_key(info):
 
 def find_java_home(prefix):
     prefix = Path(prefix)
-    for path in (prefix / "lib" / "jvm", prefix / "lib" / "jvm" / "Contents" / "Home", prefix):
-        java = path / "bin" / "java"
+    for path in (prefix / "Library", prefix / "lib" / "jvm", prefix / "lib" / "jvm" / "Contents" / "Home", prefix):
+        java = path / "bin" / ("java.exe" if IS_WINDOWS else "java")
         if java.is_file() and os.access(str(java), os.X_OK):
             return str(path)
     return None
 
 
 def fingerprint(info, java_output, library_dir, java_home):
-    files = [REQUIREMENTS, CONSTRAINTS, PROBE, HERE / "setup_env.py", HERE / "env_support.py"]
+    files = [REQUIREMENTS, constraints_for(info), PROBE, HERE / "setup_env.py", HERE / "env_support.py",
+             HERE / "platform_process.py", HERE / "execution_state.py", HERE / "run_stage.py"]
     files += sorted((HERE / "modeling").rglob("*.py"))
     libraries = []
     if library_dir:
-        for pattern in ("*omp*.dylib", "*omp*.so*"):
+        for pattern in ("*omp*.dylib", "*omp*.so*", "*omp*.dll"):
             for path in sorted(Path(library_dir).glob(pattern)):
                 libraries.append([str(path), path.stat().st_size, path.stat().st_mtime_ns])
     value = {"inventory": info, "java": java_output, "java_home": java_home,
@@ -97,6 +136,13 @@ def known_grpc_warning(result, info):
 class Manager:
     def __init__(self, args):
         self.args = args
+        if args.workdir:
+            args.workdir = os.path.abspath(os.path.expanduser(args.workdir))
+            from init_workspace import plan_workspace
+            plan_workspace(args.workdir)
+            # --no-save permits verification before creation/confirmation.
+            if (args.check or args.create) and not args.no_save:
+                work_root(args.workdir)
         state_dir = Path(SETTINGS_PATH).parent
         log_root = Path(args.log_dir).expanduser().absolute() if args.log_dir else state_dir / "logs"
         log_root.mkdir(parents=True, exist_ok=True)
@@ -128,7 +174,7 @@ class Manager:
             raise SetupError("invalid_probe_result", str(exc)) from exc
 
     def settings(self):
-        settings = load_settings()
+        settings = load_settings(self.args.workdir)
         return settings if isinstance(settings, dict) else {}
 
     def candidates(self):
@@ -138,20 +184,25 @@ class Manager:
             choices.append((saved, "saved"))
         for directory in os.environ.get("PATH", "").split(os.pathsep):
             if directory:
-                for name in ("python3.9", "python3", "python"):
+                for name in (("python.exe", "python3.exe", "python3.9.exe") if IS_WINDOWS else ("python3.9", "python3", "python")):
                     path = Path(directory) / name
                     if path.is_file() and os.access(str(path), os.X_OK):
                         choices.append((str(path.absolute()), "PATH"))
-        for path in ("/opt/homebrew/opt/python@3.9/bin/python3.9", "/usr/local/bin/python3.9"):
+        for variable in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+            if os.environ.get(variable):
+                path = environment_python(os.environ[variable], venv=variable == "VIRTUAL_ENV")
+                if path.is_file():
+                    choices.append((str(path), variable))
+        for path in (() if IS_WINDOWS else ("/opt/homebrew/opt/python@3.9/bin/python3.9", "/usr/local/bin/python3.9")):
             if Path(path).is_file():
                 choices.append((path, "system"))
-        conda = self.args.conda or shutil.which("conda")
+        conda = conda_executable(self.args.conda)
         if conda:
             result = self.run("conda-list", [conda, "env", "list", "--json"], timeout=30)
             if result["ok"]:
                 try:
                     for prefix in json.loads(result["output"])["envs"]:
-                        choices.append((str(Path(prefix) / "bin" / "python"), "conda:" + Path(prefix).name))
+                        choices.append((str(environment_python(prefix)), "conda:" + Path(prefix).name))
                 except (ValueError, KeyError):
                     self.report["warnings"].append("无法解析 conda 环境列表，仍可指定 --python 绝对路径")
         unique = []
@@ -178,17 +229,18 @@ class Manager:
 
     def env(self, python, reuse=True):
         saved = self.settings() if reuse and self.settings().get("python") == python else {}
-        prefix = Path(python).parent.parent
+        prefix = environment_prefix(python)
         library = self.args.library_dir or saved.get("library_dir")
-        if not library and any((prefix / "lib").glob("lib*omp*")):
-            library = str(prefix / "lib")
-        java_home = self.args.java_home or saved.get("java_home") or find_java_home(prefix)
+        lib_path = prefix / "Library" / "bin" if IS_WINDOWS else prefix / "lib"
+        if not library and (lib_path.is_dir() if IS_WINDOWS else any(lib_path.glob("lib*omp*"))):
+            library = str(lib_path)
+        java_home = self.args.java_home or saved.get("java_home") or find_java_home(prefix) or os.environ.get("JAVA_HOME")
         mapping = self.args.mapping_dir if self.args.mapping_dir is not None else self.settings().get("mapping_dir")
         for field, path in (("library_dir", library), ("java_home", java_home), ("mapping_dir", mapping)):
             if path and not Path(path).expanduser().is_dir():
                 raise SetupError("invalid_path", "%s 目录不存在：%s" % (field, path))
-        if java_home and not os.access(str(Path(java_home).expanduser() / "bin" / "java"), os.X_OK):
-            raise SetupError("missing_java", "指定 JDK 中不存在 bin/java：" + java_home)
+        if java_home and not os.access(str(Path(java_home).expanduser() / "bin" / ("java.exe" if IS_WINDOWS else "java")), os.X_OK):
+            raise SetupError("missing_java", "指定 JDK 中不存在可执行的 bin/java 或 bin/java.exe：" + java_home)
         self.runtime = {"library_dir": str(Path(library).expanduser().absolute()) if library else None,
                         "java_home": str(Path(java_home).expanduser().absolute()) if java_home else None,
                         "mapping_dir": str(Path(mapping).expanduser().absolute()) if mapping else None}
@@ -198,6 +250,7 @@ class Manager:
         env = self.env(python)
         info = self.probe(python, "inventory", env)
         self.report["environment"] = info
+        self.report["dependency_profile"] = str(constraints_for(info))
         validate_profile(info)
         check_versions(info)
         java = self.java(env)
@@ -224,10 +277,14 @@ class Manager:
                         "report": old.get("verification", {}).get("report") if reuse else str(self.log_dir / "report.json")}
         if not self.args.no_save:
             old.update(python=python, checked_at=now, verification=verification, **self.runtime)
-            atomic_json(SETTINGS_PATH, old)
+            if self.args.workdir:
+                update_project(self.args.workdir, environment=old)
+            else:
+                atomic_json(SETTINGS_PATH, old)
         self.report.update(ok=True, reused=reuse, full_verified=True,
                            settings_saved=not self.args.no_save, python=python,
-                           settings_path=SETTINGS_PATH, runtime=self.runtime)
+                           settings_path=str(Path(self.args.workdir) / PROJECT_FILE) if self.args.workdir else SETTINGS_PATH,
+                           runtime=self.runtime)
         return self.report
 
     def java(self, env):
@@ -331,7 +388,7 @@ class Manager:
         dest.mkdir(parents=True, exist_ok=True)
         result = self.run("build-wheels", [python, "-m", "pip", "wheel", "--wheel-dir", str(dest),
                           "--prefer-binary", "-r", str(REQUIREMENTS), "-r", str(BOOTSTRAP),
-                          "-c", str(CONSTRAINTS)] + self.index_args(), env=env, timeout=self.args.install_timeout)
+                          "-c", str(constraints_for(info))] + self.index_args(), env=env, timeout=self.args.install_timeout)
         require_step(result, "installation_failed")
         manifest = {"schema_version": 1, "created_at": stamp(), "target": target_key(info),
                     "build_platform": info["platform"], "requirements_sha256": sha256(REQUIREMENTS),
@@ -359,6 +416,12 @@ class Manager:
             info = self.probe(base, "inventory", env)
             validate_profile(info)
             self.java(env)
+            # venv does not copy its base interpreter's Java/OpenMP runtime.
+            # Retain auto-discovered locations, just as explicit overrides work.
+            if not args.library_dir:
+                args.library_dir = self.runtime.get("library_dir")
+            if not args.java_home:
+                args.java_home = self.runtime.get("java_home")
             if args.wheel_dir:
                 bundle = self.bundle(args.wheel_dir, info)
             else:
@@ -366,14 +429,15 @@ class Manager:
             require_step(self.run("create-venv", [base, "-m", "venv", str(prefix)], env=env,
                                   timeout=args.install_timeout), "installation_failed")
         else:
-            conda = args.conda or shutil.which("conda")
+            conda = conda_executable(args.conda)
             if not conda:
                 raise SetupError("missing_conda", "未找到 conda；可指定 --conda，或 --base-python 使用已有 Python 3.9 创建 venv")
             self.index_args()
             env = runtime_env(sys.executable)
             machine = native_machine()
             subdir = {("Darwin", "arm64"): "osx-arm64", ("Darwin", "x86_64"): "osx-64",
-                      ("Linux", "arm64"): "linux-aarch64", ("Linux", "x86_64"): "linux-64"}.get((platform.system(), machine))
+                      ("Linux", "arm64"): "linux-aarch64", ("Linux", "x86_64"): "linux-64",
+                      ("Windows", "x86_64"): "win-64"}.get((platform.system(), machine))
             if not subdir:
                 raise SetupError("unsupported_system", "无法选择 conda 原生架构")
             env["CONDA_SUBDIR"] = subdir
@@ -383,19 +447,22 @@ class Manager:
             # Bootstrap tools are pinned by pip below; do not couple conda's build
             # variants to PyPI's version availability during Python creation.
             packages = ["python=3.9", "pip", "openjdk=17"]
-            packages.append("llvm-openmp=18.1.8" if platform.system() == "Darwin" else "libgomp")
+            packages.append("llvm-openmp=18.1.8" if platform.system() == "Darwin" else ("intel-openmp" if IS_WINDOWS else "libgomp"))
             require_step(self.run("create-conda", [conda, "create", "--yes", "--prefix", str(prefix),
                                      "--override-channels", "--channel", "conda-forge"] + packages,
                                   env=env, timeout=args.install_timeout), "installation_failed")
             # Native packages may need the environment's lib path at dynamic load time.
             if not args.library_dir:
-                args.library_dir = str(prefix / "lib")
+                args.library_dir = str(prefix / "Library" / "bin" if IS_WINDOWS else prefix / "lib")
             if not args.java_home:
                 args.java_home = find_java_home(prefix)
                 if not args.java_home:
                     raise SetupError("missing_java", "新 conda 环境内未找到可执行的 Java：" + str(prefix))
-        python = str(prefix / "bin" / "python")
+        python = str(environment_python(prefix, venv=bool(args.base_python or args.wheel_dir)))
         env = self.env(python, reuse=False)
+        # Resolve target-specific dependencies in the new interpreter.
+        info = self.probe(python, "inventory", env)
+        validate_profile(info)
         pip_base = [python, "-m", "pip", "install", "--no-input", "--disable-pip-version-check"]
         if bundle:
             directory, lock = bundle
@@ -407,7 +474,7 @@ class Manager:
             require_step(self.run("bootstrap-pip", pip_base + ["-r", str(BOOTSTRAP)] + self.index_args(),
                                   env=env, timeout=args.install_timeout), "installation_failed")
             require_step(self.run("install-online", pip_base + ["--prefer-binary", "-r", str(REQUIREMENTS),
-                                  "-c", str(CONSTRAINTS)] + self.index_args(), env=env,
+                                  "-c", str(constraints_for(info))] + self.index_args(), env=env,
                                   timeout=args.install_timeout), "installation_failed")
         return self.check(python)
 
@@ -420,6 +487,7 @@ def parser():
     actions.add_argument("--create", action="store_true", help="新建独立 riskmodel-py39；绝不安装到已有路径")
     actions.add_argument("--download-wheels", metavar="DIR", help="在目标同类机器上准备带清单的离线 wheel 包")
     p.add_argument("--python", help="检查/下载所用 Python 路径、PATH 命令或 conda 环境名")
+    p.add_argument("-w", "--workdir", help="绑定或复用本项目环境；省略时使用本机公共设置")
     p.add_argument("--base-python", help="使用已有 CPython 3.9 创建 venv；离线创建必填")
     p.add_argument("--prefix", help="新环境目录，默认 ~/.risk-modeling/envs/riskmodel-py39")
     p.add_argument("--conda", help="conda 可执行文件路径")
@@ -456,7 +524,7 @@ def main():
             result = manager.download(manager.resolve_python(args.python), args.download_wheels)
         else:
             result = manager.check(manager.resolve_python(args.python))
-    except (SetupError, OSError, ValueError) as exc:
+    except (SetupError, TaskError, OSError, ValueError) as exc:
         result = manager.report if manager else {}
         result.update(ok=False, error_kind=getattr(exc, "kind", "filesystem_error"), error=str(exc),
                       options=getattr(exc, "options", ["检查路径和访问权限后重试"]))

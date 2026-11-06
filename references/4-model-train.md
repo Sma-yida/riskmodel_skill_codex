@@ -103,6 +103,20 @@ run_hpo 为 true 时，Optuna 在这些范围内搜索 LightGBM 参数。写法�
 LightGBM 的 run_hpo、n_trials、hpo_params 不控制评分卡或 AutoGluon。AutoGluon 未保存 predictor 时，允许查看训练对比，但不能继续模型评估。
 训练早停 test、寻优目标集、最终报告主验证集可能不同，按输出明确名称；不能把使用 OOT 寻优后的 OOT 当成从未参与选择的独立验证集。
 
+## 当前 LightGBM 寻优约束的真实口径
+
+参数表保留原接口名称，但 `ks_gap_threshold` 不能解释为“最终模型保证满足 train/test 的绝对 KS 差上限”。当前后台实际为：
+- trial 的约束检查带符号的 `KS_train - KS_test <= threshold`，还检查 test 分箱单调性；不是绝对差。
+- 最终选解优先使用 `oot_main`，没有它时才使用 test。即使 optimization_targets 明确指定 test，也不改变最终选解数据集。
+- 合格候选还要求选解集的 gap 不超过阈值、分箱单调、训练 KS 严格大于该集 KS，以及 PSI 不超过 0.2。
+- 先选合格的 Pareto 候选，再找全量完成 trial 中的合格候选；仍找不到时，会忽略条件，回退到选解集 KS 最高的候选。程序成功不代表约束满足。
+
+用户要求硬约束，例如“最终必须满足 abs(train KS − test KS) ≤ 0.05，无合格候选就停止”，当前开放参数无法实现。执行前说明冲突，不把仅设置 ks_gap_threshold=0.05 的方案描述为满足这项要求；不能靠移走 OOT、增加轮数或调整措辞默默改变用户目标。
+
+读取结果时同时核对“最终选解数据集”“模型寻优方式”和完整 trial 明细，说明是否发生回退。报告中的寻优次数可能是配置预算；实际完成次数从 trial 明细/日志核对，不能把设置 10 次直接等同于成功完成 10 次。
+
+普通模式与 HPO 的树数参数分开：当前普通模式模板为 5；HPO 默认候选 [500] 覆盖普通树数，并使用早停，最终采用的树数可能少于 500。“改为 100 棵树”时先核对当前 run_hpo；已经开启寻优时不能承诺只改 lightgbm_params.n_estimators 就能生效。
+
 ## 用户说法与参数
 
 | 用户说法 | 提交给 make_config 的变化 |
@@ -122,14 +136,21 @@ LightGBM 的 run_hpo、n_trials、hpo_params 不控制评分卡或 AutoGluon。A
 ## 结果与明细
 
 LightGBM 读取模型性能指标、寻优信息和特征重要性；重要性 JSON 可能只列前 15 个，完整表为 `outputs/model_train/outputs/feature_imp.csv`。
+预测值过少、分箱退化或 Lift 含 nan/inf 时，直接说明报告局限。当前单调性函数在有效分箱不足两个时也可能返回“零违背”，不能解释成十分箱单调性良好；必须同时看实际分箱数量与有效值。特征重要性中只有少数非零变量，与筛选阶段保留了多少变量是不同事实。
 AutoGluon JSON 排名可能只列前 15 个，完整表为 `outputs/model_train/outputs/autogluon_leaderboard.csv`。具体模型名从这次排名读取。
 评分卡的 IV 来自训练评分卡分箱，PSI 按训练切点比较主验证集（优先 oot_main，否则 test）与 train；不能与特征筛选阶段数字直接对照判错。查看 `outputs/model_train/LR/outputs/` 的 binning_review.csv、binning_detail.csv、scorecard_points.csv；完整报告在 `LR/report/评分卡模型报告.xlsx`。
 
 ## 推荐下一步与失败处理
 
-- “评估本次训练模型”：先核对类型和模型是否保存，默认继承训练类型。
-- “查看完整模型报告/分箱明细/模型排名”：只读当前产物。
-- “调整指定参数重新训练”：列出具体参数、预算和评估将过期的影响后确认；未明确值则补充信息。
-- 第 4 项为自定义输入。
+按 [统一交互格式](first-use.md#环节指引与推荐问) 输出指引。下一步：模型评估；执行说明：评估当前模型的区分能力和稳定性，生成评估报告；评分卡则说明复用训练结果生成摘要。
+
+LightGBM/已保存模型的 AutoGluon 推荐问候选（选择后仍需标准需求确认）：
+1. “使用默认评估参数，评估刚训练的模型。”
+2. “评估刚训练的模型，将 Lift 分箱数设为 20。”
+3. “评估刚训练的模型，不生成后台评估 Excel。”
+4. LightGBM：“重新训练 LightGBM，关闭寻优，树数设为 50。”；AutoGluon：“重新训练 AutoGluon，时间预算设为 600 秒，并保存模型。”
+
+前两项在 LightGBM 分支需于确认清单说明 Excel 复现拟合；第三项对应 `gen_eval_report=false`，仍有 JSON/Markdown/HTML 摘要。已有明确“不拟合”要求时不能推荐相冲突的默认报告方案。AutoGluon 可用本次排名中的准确模型名替换一个变体，不猜名称。
+评分卡只给有效选项，例如“生成本次评分卡评估摘要”“重新训练评分卡，改用等频分箱”；不要凑四项，不推荐用评估参数调整评分卡。模型未保存、硬约束未满足或退化分箱时先说明限制，必要时给训练纠正选项，不暗示评估能修复训练问题。
 
 PMML 缺失是 LightGBM 训练交付失败，即使已有 JSON 也不能放行。评分卡 list.remove 异常属于已知依赖边界，不自行删样本、改算法或升级包。训练数据单一标签、空特征、内存不足、Java 异常均按日志证据处理。AutoGluon 限时导致部分模型失败时如实说明实际排名，不承诺所有算法都已成功。

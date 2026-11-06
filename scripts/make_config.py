@@ -18,6 +18,7 @@ import copy
 import datetime
 from contextlib import nullcontext
 import json
+import math
 import os
 import sys
 
@@ -180,7 +181,7 @@ class Bad(Exception):
 
 
 def _is_num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return (isinstance(v, int) and not isinstance(v, bool)) or (isinstance(v, float) and math.isfinite(v))
 
 
 def _bounds_text(spec):
@@ -251,7 +252,7 @@ def check_value(spec, v):
         return v
     if kind == "number":
         if not _is_num(v):
-            raise Bad("应为数字，收到 %s" % json.dumps(v, ensure_ascii=False))
+            raise Bad("应为有限数字，不支持 NaN 或无穷大，收到 %s" % json.dumps(v, ensure_ascii=False))
         _check_bounds(v, spec)
         return v
     if kind == "enum":
@@ -450,6 +451,10 @@ def cross_check(stage, old, new, changes, template, workdir, defer_data_range=Fa
             s["psi_split_range"] = list(s["oot_split_range"])
             notes.append("未单独指定 PSI 数据集时间范围，按规则与测试集(OOT)时间范围相同")
         if s["method"] == "date_range":
+            train_start, train_end = s["train_split_range"]
+            test_start, test_end = s["oot_split_range"]
+            if max(train_start, test_start) <= min(train_end, test_end):
+                err("oot_split_range", "训练集与测试集日期范围不能重叠（两端日期均包含），否则同一条样本可能进入两组；请调整范围")
             t = template["settings"]
             for key, label in (("train_split_range", "训练集时间范围"), ("oot_split_range", "测试集(OOT)时间范围")):
                 if key not in changes and s[key] == t[key] and old["settings"]["method"] != "date_range":
@@ -474,7 +479,7 @@ def cross_check(stage, old, new, changes, template, workdir, defer_data_range=Fa
         if base_used:
             err("user_feature_list", "%s 是主键/日期/标签/渠道列，不能作为入模特征" % "、".join(base_used))
         data_file = find_data_file(os.path.join(workdir, "data"), "data")
-        cols = read_columns(data_file) if data_file else None
+        cols = read_columns(data_file, workdir=workdir) if data_file else None
         if cols is None:
             warnings.append("无法读取数据列名，未核对 user_feature_list 中的特征是否存在")
         else:
@@ -517,11 +522,14 @@ def cross_check(stage, old, new, changes, template, workdir, defer_data_range=Fa
 def user_values(stage, cfg):
     """按用户侧参数名读出配置中的当前值。"""
     out = {}
-    for name, spec in SPEC[stage].items():
-        if spec["kind"] == "group":
-            out[name] = {sub: get_path(cfg, s["path"]) for sub, s in spec["params"].items()}
-        else:
-            out[name] = get_path(cfg, spec["path"])
+    try:
+        for name, spec in SPEC[stage].items():
+            if spec["kind"] == "group":
+                out[name] = {sub: get_path(cfg, s["path"]) for sub, s in spec["params"].items()}
+            else:
+                out[name] = get_path(cfg, spec["path"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError("%s 配置结构不完整或字段类型错误，请核对原文件或从备份恢复；未自动覆盖配置" % stage) from exc
     return out
 
 
@@ -537,7 +545,11 @@ def diff(stage, old, new):
 def load_current(workdir, stage):
     path = config_path(workdir, stage) if workdir else None
     if path and os.path.exists(path):
-        return load_json(path), True
+        cfg = load_json(path)
+        user_values(stage, cfg)
+        if not isinstance(cfg.get("output_path"), dict):
+            raise ValueError("%s 配置缺少有效的 output_path 对象；未自动覆盖配置" % stage)
+        return cfg, True
     return load_json(template_path(stage)), False
 
 
@@ -574,31 +586,44 @@ def main():
     args = ap.parse_args()
 
     workdir = resolve_workdir(args.workdir)
-    if workdir is None or not os.path.isdir(os.path.join(workdir, "config")):
+    readonly = bool(args.check or args.show)
+    if workdir is None or (not readonly and not os.path.isdir(os.path.join(workdir, "config"))):
         emit({"ok": False, "error": "找不到工作目录%s，请先用 init_workspace.py 创建" % ("（%s）" % args.workdir if args.workdir else "")})
+
+    # Read defaults at a proposed location so creating a workspace and executing
+    # the reviewed modeling request can share one confirmation.
+    if readonly:
+        from init_workspace import plan_workspace
+        try:
+            plan_workspace(workdir)
+        except (OSError, ValueError) as exc:
+            emit({"ok": False, "error_kind": "workspace_error", "error": str(exc)})
 
     if args.show:
         if args.show not in SPEC:
             emit({"ok": False, "error": "未知环节 %s；可选：%s" % (args.show, "、".join(STAGE_IDS))})
-        cfg, exists = load_current(workdir, args.show)
-        emit({"ok": True, "stage": args.show, "name": STAGE_NAMES[args.show],
-              "source": "工作目录配置" if exists else "默认配置（尚未修改过）",
-              "params": user_values(args.show, cfg)})
+        try:
+            cfg, exists = load_current(workdir, args.show)
+            emit({"ok": True, "stage": args.show, "name": STAGE_NAMES[args.show],
+                  "source": "工作目录配置" if exists else "默认配置（尚未修改过）",
+                  "params": user_values(args.show, cfg)})
+        except (OSError, ValueError) as exc:
+            emit({"ok": False, "error_kind": "config_error", "error": str(exc)})
 
     try:
         if args.set_file:
-            with open(args.set_file, "r", encoding="utf-8") as f:
+            with open(args.set_file, "r", encoding="utf-8-sig") as f:
                 all_changes = json.load(f)
         elif args.set_json is not None:
             all_changes = json.loads(args.set_json)
         else:
             emit({"ok": False, "error": "需要 --set、--set-file 或 --show 之一"}, 2)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         emit({"ok": False, "error": "JSON 解析失败：%s。引号不好处理时可改用 --set-file" % e})
 
     from execution_state import TaskError, mutation_lock, within, work_root
     try:
-        root = work_root(workdir)
+        root = plan_workspace(workdir)[0] if args.check else work_root(workdir)
         with nullcontext() if args.check else mutation_lock(root):
             results, errors, warnings = prepare(workdir, all_changes)
             out = {"ok": not errors, "mode": "check" if args.check else "write", "workdir": workdir,

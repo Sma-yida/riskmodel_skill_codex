@@ -7,6 +7,9 @@ import json
 import os
 import subprocess
 import sys
+from env_support import configure_stdio
+
+configure_stdio()
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELING_DIR = os.path.join(SKILL_DIR, "scripts", "modeling")
@@ -65,11 +68,8 @@ def load_json(path):
 
 
 def save_json(path, obj):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=4)
-    os.replace(tmp, path)
+    from env_support import atomic_json
+    atomic_json(path, obj)
 
 
 def is_workdir(path):
@@ -97,12 +97,25 @@ def template_path(stage):
     return os.path.join(TEMPLATE_DIR, "%s_config.json" % stage)
 
 
-def load_settings():
+def load_settings(workdir=None):
+    # A bound project must never silently switch to another project's default.
+    # Missing/deleted interpreters are reported by setup/preflight, not replaced.
+    if workdir:
+        from project_state import read_project
+        project = read_project(workdir)
+        if "environment" in project:
+            return project["environment"]
     if os.path.exists(SETTINGS_PATH):
         try:
-            return load_json(SETTINGS_PATH)
-        except (ValueError, OSError):
-            return {}
+            settings = load_json(SETTINGS_PATH)
+        except (ValueError, OSError) as exc:
+            raise ValueError("无法读取本机环境记录，请核对文件：" + SETTINGS_PATH) from exc
+        if (not isinstance(settings, dict)
+                or not isinstance(settings.get("verification", {}), dict)
+                or any(settings.get(k) is not None and not isinstance(settings[k], str)
+                       for k in ("python", "java_home", "library_dir", "mapping_dir"))):
+            raise ValueError("本机环境记录格式无效，请核对文件：" + SETTINGS_PATH)
+        return settings
     return {}
 
 
@@ -127,7 +140,7 @@ def list_oot_names(workdir):
     return sorted(names)
 
 
-def read_columns(path):
+def read_columns(path, workdir=None):
     """读取数据文件的列名。CSV 直接读表头；parquet/feather 借用建模环境的 pyarrow。读不到返回 None。"""
     if path.endswith(".csv"):
         for enc in ("utf-8-sig", "gbk"):
@@ -137,7 +150,7 @@ def read_columns(path):
             except (UnicodeDecodeError, StopIteration):
                 continue
         return None
-    python = load_settings().get("python")
+    python = load_settings(workdir).get("python")
     if not python or not os.path.exists(python):
         return None
     code = (

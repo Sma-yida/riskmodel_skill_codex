@@ -9,6 +9,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from platform_process import IS_WINDOWS, spawn_tree, cleanup_windows
+
+
+def configure_stdio():
+    # Windows pipes otherwise use the ANSI code page. The CLI protocol is UTF-8,
+    # including stderr paths/progress; changing only child env variables is too late.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and not stream.closed:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 ERROR_OPTIONS = {
     "missing_openmp": ["用 --library-dir 指定同架构 OpenMP 动态库目录", "联网使用 conda 新建含 OpenMP 的独立环境"],
@@ -21,6 +30,7 @@ ERROR_OPTIONS = {
     "wheel_unavailable": ["检查 wheel 包是否匹配目标系统、架构和 Python 3.9", "在目标同类机器重新执行 --download-wheels"],
     "version_conflict": ["为新版本新建独立环境，不升级旧模型环境", "根据日志核对固定依赖和所选 Python"],
     "cleanup_permission": ["在允许清理子进程的终端重新验证", "检查日志并确认本次 Python/Java 子进程已退出"],
+    "process_control_unavailable": ["在允许 Windows Job 管理的本机终端运行检查", "保留日志排查宿主进程限制；不绕过进程监管"],
 }
 
 
@@ -81,12 +91,21 @@ def runtime_env(python, library_dir=None, java_home=None, mapping_dir=None, cach
                PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2", PIP_CONFIG_FILE=os.devnull,
                PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
-    env["PATH"] = str(Path(python).absolute().parent) + os.pathsep + env.get("PATH", "")
+    directory = Path(python).absolute().parent
+    paths = [str(directory)]
+    if IS_WINDOWS:
+        prefix = directory.parent if directory.name.lower() == "scripts" else directory
+        paths += [str(prefix / "Scripts"), str(prefix / "Library" / "bin")]
+        dll_dirs = [prefix / "Library" / "bin"]
+        if library_dir:
+            dll_dirs.append(Path(library_dir))
+        env["RISKMODEL_DLL_DIRS"] = json.dumps([str(p.absolute()) for p in dll_dirs if p.is_dir()])
+    env["PATH"] = os.pathsep.join(paths) + os.pathsep + env.get("PATH", "")
     if java_home:
         env["JAVA_HOME"] = str(java_home)
         env["PATH"] = str(Path(java_home) / "bin") + os.pathsep + env["PATH"]
     if library_dir:
-        key = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        key = "PATH" if IS_WINDOWS else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
         env[key] = str(library_dir) + (os.pathsep + env[key] if env.get(key) else "")
     if mapping_dir:
         env["RISKMODEL_MAPPING_DIR"] = str(mapping_dir)
@@ -95,6 +114,19 @@ def runtime_env(python, library_dir=None, java_home=None, mapping_dir=None, cach
     if cache_dir:
         env["MPLCONFIGDIR"] = str(cache_dir)
     return env
+
+
+_DLL_HANDLES = []
+
+
+def enable_windows_dlls():
+    """Python 3.8+ DLL dependency lookup does not generally search PATH.
+
+    Keep handles alive for the lifetime of the selected model interpreter.
+    """
+    if IS_WINDOWS and hasattr(os, "add_dll_directory"):
+        for path in json.loads(os.environ.get("RISKMODEL_DLL_DIRS", "[]")):
+            _DLL_HANDLES.append(os.add_dll_directory(path))
 
 
 def diagnose(output, fallback="check_failed"):
@@ -117,6 +149,7 @@ def diagnose(output, fallback="check_failed"):
 
 def run_step(name, command, log_dir, env=None, cwd=None, timeout=180):
     """Bound the whole process group (including Java), keep logs, report progress."""
+    configure_stdio()
     path = Path(log_dir) / (name + ".log")
     path.parent.mkdir(parents=True, exist_ok=True)
     print("[%s] 开始；日志：%s" % (name, path), file=sys.stderr, flush=True)
@@ -126,9 +159,8 @@ def run_step(name, command, log_dir, env=None, cwd=None, timeout=180):
     cleanup_warning = None
     try:
         with path.open("wb") as log:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       stdin=subprocess.DEVNULL, env=env, cwd=cwd,
-                                       start_new_session=True)
+            process = spawn_tree(command, stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, env=env, cwd=cwd)
             next_progress = start + 15
             while process.poll() is None:
                 now = time.monotonic()
@@ -141,23 +173,32 @@ def run_step(name, command, log_dir, env=None, cwd=None, timeout=180):
                     next_progress = now + 15
                 time.sleep(0.1)
     except OSError as exc:
-        raise SetupError("executable_unavailable", str(exc)) from exc
+        raise SetupError(getattr(exc, "kind", "executable_unavailable"), str(exc)) from exc
     finally:
         if process is not None:
             # Also clean descendants after a successful parent exits.
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-                time.sleep(0.2)
-                os.killpg(process.pid, signal.SIGKILL)
+                if IS_WINDOWS:
+                    cleanup_windows(process)
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    time.sleep(0.2)
+                    os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            except PermissionError as exc:
+            except (OSError, TimeoutError, subprocess.TimeoutExpired) as exc:
                 # Some restricted hosts deny signalling an already exited process group.
                 # Reap the parent and disclose that descendant cleanup was not confirmed.
                 cleanup_warning = str(exc)
                 if process.poll() is None:
-                    process.kill()
-            process.wait()
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                cleanup_warning = "子进程未结束，未确认清理完成"
     output = path.read_text(encoding="utf-8", errors="replace")
     result = {"name": name, "ok": process.returncode == 0 and not timed_out,
               "returncode": process.returncode, "seconds": round(time.monotonic() - start, 2),
@@ -193,7 +234,19 @@ def atomic_json(path, value):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False, indent=2)
             f.write("\n")
-        os.replace(temp, path)
+        replace_file(temp, path)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+def replace_file(source, destination):
+    """Windows readers/AV can briefly hold a file without delete sharing."""
+    for attempt in range(10):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if not IS_WINDOWS or attempt == 9:
+                raise
+            time.sleep(0.03)
